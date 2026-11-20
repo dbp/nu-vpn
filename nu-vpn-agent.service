@@ -1,0 +1,14 @@
+[Unit]
+Description=Northeastern VPN hands-off sign-in (NetworkManager secret agent)
+Documentation=file://%h/code/nu-vpn/README.md
+PartOf=graphical-session.target
+# NetworkManager asks the most recently started agent first: start after Plasma's.
+After=graphical-session.target plasma-kded6.service
+
+[Service]
+ExecStart=%h/.local/bin/nu-vpn agent
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

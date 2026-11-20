@@ -1,0 +1,1177 @@
+#!/usr/bin/python3
+"""nu-vpn: hands-off GlobalProtect (SAML) sign-in for NetworkManager.
+
+When you click Connect on the VPN in Plasma's network applet, NetworkManager
+asks its secret agents for the VPN cookie. `nu-vpn agent` is registered after
+Plasma's agent, so NetworkManager asks it first. It then:
+
+  1. asks the GlobalProtect portal where to sign in (Microsoft Entra SAML),
+  2. drives a hidden WebKit view: fills in the username and the password from
+     your keyring, accepts "Stay signed in?" and Duo's "Is this your device?",
+  3. pops up one small box for the Duo Mobile passcode, if Duo asks for one
+     (no box at all when the remembered Microsoft/Duo session still holds),
+  4. has openconnect turn the SAML result into a gateway cookie, and
+  5. hands cookie/gateway/certificate back to NetworkManager, which connects.
+
+If a page shows up that it doesn't know how to handle, the hidden browser
+window is shown so you can finish by hand. Cancelling the code box cancels
+the connection. Any other failure falls back to Plasma's usual dialog.
+
+Subcommands:
+  setup    save your username (config file) and password (keyring)
+  login    run the sign-in once and print what happened (for debugging)
+  agent    run the NetworkManager secret agent (the systemd user service)
+  connect  bring the VPN up through NetworkManager (same as clicking Connect)
+  forget   clear the remembered Microsoft/Duo browser session
+"""
+
+import argparse
+import base64
+import configparser
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+APP = "nu-vpn"
+TITLE = "Northeastern VPN"
+SCRIPT = Path(__file__).resolve()
+HOME = Path.home()
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config") / APP
+DATA_DIR = Path(os.environ.get("XDG_DATA_HOME") or HOME / ".local/share") / APP
+CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME") or HOME / ".cache") / APP
+CONFIG_FILE = CONFIG_DIR / "config.ini"
+TRACE_FILE = CACHE_DIR / "last-login.log"
+
+EXIT_FAILED = 1
+EXIT_CANCELED = 2
+EXIT_NEEDS_USER = 3      # interaction needed but NetworkManager didn't allow it
+
+LOGIN_TIMEOUT = 110      # NetworkManager gives a secret agent 120 s to answer
+STUCK_AFTER = 20         # seconds on an unrecognised page before showing the window
+MAX_TRIES = 3            # times to retry one action before showing the window
+MAX_PUSHES = 3           # Duo pushes to (re)send before giving up
+# Microsoft's pages re-render ~0.7-0.9 s after they appear, swapping in fresh
+# elements (an empty username box; buttons whose clicks then go nowhere), so
+# on those pages an element must have existed this long before we use it.
+# For the Duo code, checking the value is still there is enough.
+SETTLE_MS = 1200
+# (Once Microsoft remembers you, the first page is the password one.)
+SETTLE_STATES = ("username", "password", "picker", "proofs", "continue", "kmsi")
+
+
+class Abort(Exception):
+    def __init__(self, message, code=EXIT_FAILED):
+        super().__init__(message)
+        self.code = code
+
+
+def log(msg):
+    print(f"{APP}: {msg}", file=sys.stderr, flush=True)
+
+
+# ---------------------------------------------------------------- config ---
+
+def load_config():
+    cp = configparser.ConfigParser()
+    cp.read(CONFIG_FILE)
+    for section in ("vpn", "login"):
+        if not cp.has_section(section):
+            cp.add_section(section)
+    return cp
+
+
+def save_config(cp):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = CONFIG_FILE.with_suffix(".tmp")
+    with open(tmp, "w") as f:
+        cp.write(f)
+    tmp.replace(CONFIG_FILE)
+
+
+def config_uuids(cfg):
+    return cfg.get("vpn", "uuid", fallback="").split()
+
+
+# --------------------------------------------------------------- keyring ---
+
+def _keyring():
+    import gi
+    gi.require_version("Secret", "1")
+    from gi.repository import Secret
+    schema = Secret.Schema.new("edu.northeastern.nu-vpn", Secret.SchemaFlags.NONE,
+                               {"username": Secret.SchemaAttributeType.STRING})
+    return Secret, schema
+
+
+def get_password(username):
+    Secret, schema = _keyring()
+    return Secret.password_lookup_sync(schema, {"username": username}, None)
+
+
+def store_password(username, password):
+    Secret, schema = _keyring()
+    ok = Secret.password_store_sync(schema, {"username": username}, Secret.COLLECTION_DEFAULT,
+                                    f"{TITLE} password ({username})", password, None)
+    if not ok:
+        raise Abort("could not save the password in the keyring")
+
+
+# --------------------------------------------------------------- dialogs ---
+
+def kdialog_argv(kind, text, default=""):
+    if kind == "password":
+        return ["kdialog", "--title", TITLE, "--password", text]
+    return ["kdialog", "--title", TITLE, "--inputbox", text, default]
+
+
+def ask_sync(kind, text, default=""):
+    """Prompt with kdialog when there's a desktop, else on the terminal."""
+    if shutil.which("kdialog") and (os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DISPLAY")):
+        p = subprocess.run(kdialog_argv(kind, text, default), capture_output=True, text=True)
+        if p.returncode != 0:
+            raise Abort("cancelled", EXIT_CANCELED)
+        return p.stdout.rstrip("\n")
+    if sys.stdin.isatty():
+        import getpass
+        if kind == "password":
+            return getpass.getpass(text + " ")
+        answer = input(f"{text} [{default}] " if default else f"{text} ")
+        return answer.strip() or default
+    raise Abort("no way to ask for input (no desktop, no terminal)")
+
+
+def notify(text, replaces=0, timeout_ms=10000, summary=TITLE, urgent=False):
+    """Desktop notification; returns its id (0 if it couldn't be shown).
+    Urgent ones stay on screen until closed."""
+    try:
+        from gi.repository import Gio, GLib
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        hints = {"urgency": GLib.Variant("y", 2)} if urgent else {}
+        reply = bus.call_sync(
+            "org.freedesktop.Notifications", "/org/freedesktop/Notifications",
+            "org.freedesktop.Notifications", "Notify",
+            GLib.Variant("(susssasa{sv}i)", (TITLE, replaces, "network-vpn", summary, text, [], hints,
+                                            timeout_ms)),
+            GLib.VariantType("(u)"), Gio.DBusCallFlags.NONE, 3000, None)
+        return reply.unpack()[0]
+    except Exception as e:
+        log(f"couldn't show a notification: {e}")
+        return 0
+
+
+def close_notification(nid):
+    if not nid:
+        return
+    try:
+        from gi.repository import Gio, GLib
+        Gio.bus_get_sync(Gio.BusType.SESSION, None).call_sync(
+            "org.freedesktop.Notifications", "/org/freedesktop/Notifications",
+            "org.freedesktop.Notifications", "CloseNotification", GLib.Variant("(u)", (nid,)),
+            None, Gio.DBusCallFlags.NONE, 3000, None)
+    except Exception:
+        pass
+
+
+# ------------------------------------------------------ NetworkManager -----
+
+class VpnInfo:
+    """What we need from the NetworkManager connection's vpn.data."""
+
+    def __init__(self, data, authgroup=""):
+        gw = data.get("gateway", "")
+        gw = re.sub(r"^https?://", "", gw)
+        host, _, usergroup = gw.partition("/")
+        self.host = host
+        self.interface = (usergroup.split(":")[0] or "portal") if usergroup else "portal"
+        self.protocol = data.get("protocol", "gp")
+        self.useragent = data.get("useragent", "") or "PAN GlobalProtect"
+        self.platname = data.get("reported_os", "")
+        self.authgroup = authgroup
+        if not self.host:
+            raise Abort("the NetworkManager connection has no gateway set")
+        if self.protocol != "gp":
+            raise Abort(f"only GlobalProtect is supported (connection uses {self.protocol!r})")
+
+
+def nm_vpn_data(uuid):
+    import dbus
+    bus = dbus.SystemBus()
+    settings = dbus.Interface(bus.get_object("org.freedesktop.NetworkManager",
+                                             "/org/freedesktop/NetworkManager/Settings"),
+                              "org.freedesktop.NetworkManager.Settings")
+    path = settings.GetConnectionByUuid(uuid)
+    conn = dbus.Interface(bus.get_object("org.freedesktop.NetworkManager", path),
+                          "org.freedesktop.NetworkManager.Settings.Connection")
+    s = conn.GetSettings()
+    return {str(k): str(v) for k, v in s.get("vpn", {}).get("data", {}).items()}
+
+
+# -------------------------------------------------------------- portal -----
+
+def gp_os_name(platname):
+    # Same mapping openconnect uses for the clientos field.
+    if platname in ("mac-intel", "apple-ios"):
+        return "Mac"
+    if platname in ("linux", "linux-64"):
+        return "Linux"
+    return "Windows"
+
+
+def prelogin(vpn):
+    base = "global-protect" if vpn.interface == "portal" else "ssl-vpn"
+    query = urllib.parse.urlencode({"tmp": "tmp", "kerberos-support": "yes", "ipv6-support": "yes",
+                                    "clientVer": "4100", "clientos": gp_os_name(vpn.platname)})
+    req = urllib.request.Request(f"https://{vpn.host}/{base}/prelogin.esp?{query}", data=b"",
+                                 headers={"User-Agent": vpn.useragent})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            root = ET.fromstring(r.read())
+    except OSError as e:
+        raise Abort(f"can't reach {vpn.host}: {e}")
+    status = root.findtext("status")
+    if status != "Success":
+        raise Abort(f"portal prelogin failed: {root.findtext('msg') or status}")
+    method = (root.findtext("saml-auth-method") or "").upper()
+    blob = root.findtext("saml-request") or ""
+    if not method or not blob:
+        raise Abort(f"{vpn.host} did not ask for a SAML sign-in; nothing for {APP} to automate")
+    return method, base64.b64decode(blob).decode()
+
+
+def openconnect_auth(vpn, saml):
+    oc = shutil.which("openconnect") or next(
+        (p for p in ("/usr/sbin/openconnect", "/sbin/openconnect") if os.path.exists(p)), None)
+    if not oc:
+        raise Abort("openconnect is not installed")
+    if saml.get("prelogin-cookie"):
+        cookie_name, cookie = "prelogin-cookie", saml["prelogin-cookie"]
+    else:
+        cookie_name, cookie = "portal-userauthcookie", saml["portal-userauthcookie"]
+    cmd = [oc, "--protocol", vpn.protocol, "--authenticate", "--non-inter", "--passwd-on-stdin",
+           "--useragent", vpn.useragent, "--user", saml["saml-username"],
+           "--usergroup", f"{vpn.interface}:{cookie_name}"]
+    if vpn.platname:
+        cmd += ["--os", vpn.platname]
+    if vpn.authgroup:
+        cmd += ["--authgroup", vpn.authgroup]
+    cmd.append(vpn.host)
+    try:
+        p = subprocess.run(cmd, input=cookie + "\n", capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        raise Abort("openconnect timed out logging in to the portal")
+    if p.returncode != 0:
+        tail = " / ".join(p.stderr.strip().splitlines()[-3:])
+        raise Abort(f"openconnect could not log in with the SAML result: {tail}")
+    vals = {}
+    for line in p.stdout.splitlines():
+        try:
+            parts = shlex.split(line)
+        except ValueError:
+            continue
+        if len(parts) == 1 and "=" in parts[0]:
+            k, v = parts[0].split("=", 1)
+            vals[k] = v
+    if not vals.get("COOKIE") or not vals.get("FINGERPRINT"):
+        raise Abort("openconnect didn't return a cookie")
+    secrets = {"cookie": vals["COOKIE"],
+               "gateway": vals.get("CONNECT_URL") or vals["HOST"],
+               "gwcert": vals["FINGERPRINT"]}
+    if vals.get("RESOLVE"):
+        secrets["resolve"] = vals["RESOLVE"]
+    return secrets
+
+
+# ------------------------------------------------------------- browser -----
+
+# Helpers injected ahead of every script we run in the page. Each script is
+# then evaluated as ((NU) => (SCRIPT))(__nuvpn). `var`, because the page keeps
+# its globals between our calls and a second `const` would throw.
+JS_LIB = r"""
+var __nuvpn = (() => {
+  const vis = e => {
+    if (!e || !e.isConnected) return false;
+    if (e.closest('[aria-hidden=true]')) return false;     // e.g. Microsoft's off-screen passwd field
+    const r = e.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0 || r.right <= 0 || r.bottom <= 0) return false;
+    const s = getComputedStyle(e);
+    return s.visibility !== 'hidden' && s.display !== 'none';
+  };
+  const all = s => Array.from(document.querySelectorAll(s)).filter(vis);
+  const q = s => all(s)[0] || null;
+  const text = e => ((e && (e.innerText || e.value || e.getAttribute('aria-label'))) || '').trim();
+  const CLICKABLE = 'button, a, [role=button], [role=link], [role=option], li, input[type=submit], input[type=button]';
+  // The innermost visible clickable whose text matches: clicking an <li>
+  // never reaches a handler on the <a> inside it, the reverse always does.
+  const byText = (re, sel = CLICKABLE) => {
+    const hits = all(sel).filter(e => re.test(text(e)));
+    const inner = hits.filter(e => !hits.some(o => o !== e && e.contains(o)));
+    inner.sort((a, b) => text(a).length - text(b).length);
+    return inner[0] || null;
+  };
+  // Set an input's value in a way React/Knockout notice.
+  const setValue = (el, v) => {
+    el.focus();
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(el, v);
+    el.dispatchEvent(new Event('input', {bubbles: true}));
+    el.dispatchEvent(new Event('change', {bubbles: true}));
+  };
+  const click = el => { if (!el) return false; el.click(); return true; };
+  const MS_SUBMIT = '#idSIButton9, input[type=submit], button[type=submit]';
+  const BUTTONS = 'input[type=submit], input[type=button], button, [role=button]';
+  const PUSH_SEND = /^(Send (me )?a (Duo )?push|Send (Duo )?push|Send another push|Resend( push)?|Try again)$/i;
+  const DUO_CODE = '#passcode-input, input[name="passcode-input"], input[autocomplete="one-time-code"], input[name=passcode]';
+  return {vis, all, q, text, byText, setValue, click, MS_SUBMIT, BUTTONS, PUSH_SEND, CLICKABLE, DUO_CODE};
+})();
+"""
+
+# Works out which sign-in step the page is on. Reads nothing it shouldn't:
+# field values are never returned.
+JS_CLASSIFY = r"""
+(() => {
+  const {q, all, text, byText} = NU;
+  const host = location.host;
+  const out = {host, path: location.pathname, title: document.title};
+  const body = document.body ? document.body.innerText : '';
+  const err = all('#usernameError, #passwordError, #idTD_Error, #errorText, .alert-error, [role=alert], .verify-error, .error-message')
+                .map(text).filter(Boolean)[0];
+  if (err) out.error = err.slice(0, 300);
+  // How long the element we'd act on has existed. Pages re-render shortly
+  // after appearing (Microsoft swaps in a fresh, empty username box), so
+  // acting on a brand-new element can be wasted.
+  const seen = (state, el) => {
+    out.state = state;
+    if (el) { if (!el.__nuSeen) el.__nuSeen = Date.now(); out.age = Date.now() - el.__nuSeen; }
+  };
+  let el;
+  if (/(^|\.)(login\.microsoftonline\.com|login\.microsoft\.com|login\.windows\.net)$/.test(host)) {
+    out.idp = 'ms';
+    if (q('#passwordError')) out.errorField = 'password';
+    if (q('#usernameError')) out.errorField = 'username';
+    const aad = body.match(/AADSTS\d+[^\n]*/);
+    if (aad) { out.error = aad[0].slice(0, 300); seen('ms-error', null); }
+    else if (document.querySelector('#KmsiCheckboxField') || /^\s*Stay signed in\?/m.test(body)) seen('kmsi', q('#idSIButton9'));
+    // Hand-off to Duo (Entra external authentication method).
+    else if (/^\s*Verification Required\s*$/mi.test(body) && (el = byText(/^Continue$/, NU.BUTTONS))) seen('continue', el);
+    else if (el = q('input[name=passwd], input[type=password]')) seen('password', el);
+    else if (el = q('input[name=loginfmt]')) seen('username', el);
+    else if (el = q('#tilesHolder [role=button], #tilesHolder .table, [data-test-id][role=button]')) seen('picker', el);
+    else if (el = q('#idDiv_SAOTCS_Proofs [role=button], #idDiv_SAOTCS_Proofs .table, [data-value][role=button]')) seen('proofs', el);
+  } else if (/(^|\.)duosecurity\.com$/.test(host)) {
+    out.idp = 'duo';
+    const METHOD = /^(Duo Push|Duo Mobile passcode|Text message passcode|Phone call|Bypass code|Security key|Touch ID|Windows Hello|Hardware token)/i;
+    const methods = [...new Set(all(NU.CLICKABLE).map(e => text(e).split('\n')[0].trim()).filter(t => METHOD.test(t)))];
+    if (el = q('#trust-browser-button') || byText(/^Yes, this is my device$/i)) seen('trust', el);
+    else if (el = q(NU.DUO_CODE)) seen('passcode', el);
+    else if (methods.length >= 2) { seen('methods', byText(METHOD)); out.methods = methods; }
+    else if (el = byText(NU.PUSH_SEND, NU.BUTTONS)) seen('push-send', el);
+    else if (el = byText(/^Other options$/i)) seen('other-options', el);   // e.g. waiting for the push
+    // Verified Duo Push: a short number to type into Duo Mobile. It may be one
+    // element or one per digit; it's shown big, unlike e.g. the phone's last
+    // four digits, so take the largest such number (or one marked as a code).
+    const digits = e => text(e).replace(/\s+/g, '');
+    const score = e => parseFloat(getComputedStyle(e).fontSize) +
+        (/code|verif/i.test(String(e.className) + ' ' + String(e.parentElement && e.parentElement.className)) ? 100 : 0);
+    const nums = all('div, span, p, strong, b, h1, h2, h3')
+        .filter(e => !e.closest('input, button, a, label, li') && /^\d{2,6}$/.test(digits(e)))
+        .sort((a, b) => score(b) - score(a));
+    if (nums.length && score(nums[0]) >= 20) out.pushCode = digits(nums[0]);
+  }
+  const h = q('h1, h2, [role=heading], #loginHeader');
+  out.heading = h ? text(h).slice(0, 100) : '';
+  out.buttons = all('button, input[type=submit], a, [role=button], [role=link]')
+                  .map(e => text(e).replace(/\s+/g, ' ').slice(0, 50)).filter(Boolean).slice(0, 20);
+  return JSON.stringify(out);
+})()
+"""
+
+JS_ACTIONS = {
+    # Fill, then click only if the value is still in the same box (it wasn't
+    # re-rendered away); otherwise the next tick simply tries again.
+    "username": r"""(() => {
+        const v = ARG, el = NU.q('input[name=loginfmt]'); if (!el) return 'none';
+        NU.setValue(el, v);
+        setTimeout(() => { if (el.isConnected && el.value === v) NU.click(NU.q(NU.MS_SUBMIT)); }, 300);
+        return 'ok'; })()""",
+    "password": r"""(() => {
+        const a = ARG, el = NU.q('input[name=passwd], input[type=password]'); if (!el) return 'none';
+        // Microsoft posts the form's loginfmt as the username ("AADSTS90100:
+        // login parameter is empty" when it's blank), so make sure it isn't.
+        if (el.form) el.form.querySelectorAll('input[name=loginfmt]').forEach(f => { if (!f.value) f.value = a.user; });
+        NU.setValue(el, a.pw);
+        setTimeout(() => { if (el.isConnected && el.value === a.pw) NU.click(NU.q(NU.MS_SUBMIT)); }, 300);
+        return 'ok'; })()""",
+    "kmsi": r"""(() => {
+        const cb = document.querySelector('#KmsiCheckboxField');
+        if (cb && !cb.checked) cb.click();
+        return NU.click(NU.q('#idSIButton9') || NU.byText(/^Yes$/)) ? 'ok' : 'none'; })()""",
+    "picker": r"""(() => {
+        const u = ARG.toLowerCase();
+        const tiles = NU.all('#tilesHolder [role=button], #tilesHolder .table, [data-test-id][role=button]');
+        const t = tiles.find(e => (e.getAttribute('data-test-id') || '').toLowerCase() === u)
+               || tiles.find(e => NU.text(e).toLowerCase().includes(u))
+               || NU.q('#otherTile');
+        return NU.click(t) ? 'ok' : 'none'; })()""",
+    "proofs": r"""(() => NU.click(NU.byText(/duo/i,
+        '#idDiv_SAOTCS_Proofs [role=button], #idDiv_SAOTCS_Proofs .table, [data-value][role=button]')) ? 'ok' : 'none')()""",
+    "continue": r"""(() => NU.click(NU.byText(/^Continue$/, NU.BUTTONS)) ? 'ok' : 'none')()""",
+    "other-options": r"""(() => NU.click(NU.byText(/^Other options$/i)) ? 'ok' : 'none')()""",
+    "methods": r"""(() => NU.click(NU.byText(/^Duo Mobile passcode/i)) ? 'ok' : 'none')()""",
+    "method-push": r"""(() => NU.click(NU.byText(/^Duo Push/i)) ? 'ok' : 'none')()""",
+    "push-send": r"""(() => NU.click(NU.byText(NU.PUSH_SEND, NU.BUTTONS)) ? 'ok' : 'none')()""",
+    "passcode": r"""(() => {
+        const v = ARG, el = NU.q(NU.DUO_CODE); if (!el) return 'none';
+        NU.setValue(el, v);
+        setTimeout(() => { if (el.isConnected && el.value === v)
+            NU.click(NU.q('[data-testid=verify-button]')
+                     || NU.byText(/^(Verify|Submit|Log in)$/i, 'button, input[type=submit]')
+                     || NU.q('button[type=submit]')); }, 300);
+        return 'ok'; })()""",
+    "trust": r"""(() => NU.click(NU.q('#trust-browser-button') || NU.byText(/^Yes, this is my device$/i)) ? 'ok' : 'none')()""",
+}
+
+
+class SamlBrowser:
+    """Runs the SAML sign-in in a (normally hidden) WebKit view."""
+
+    def __init__(self, vpn, username, interactive, deadline, probe=False, duo="push"):
+        import gi
+        gi.require_version("Gtk", "4.0")
+        gi.require_version("WebKit", "6.0")
+        gi.require_version("Soup", "3.0")
+        gi.require_version("GLibUnix", "2.0")
+        from gi.repository import Gio, GLib, GLibUnix, Gtk, WebKit
+        self.Gio, self.GLib, self.GLibUnix, self.Gtk, self.WebKit = Gio, GLib, GLibUnix, Gtk, WebKit
+
+        self.vpn = vpn
+        self.username = username
+        self.interactive = interactive
+        self.deadline = deadline
+        self.probe = probe
+        self.result = None
+        self.error = None
+        self.busy = False            # a JS call or a dialog is in flight
+        self.shown = False
+        self.shown_at = None         # (host, path, state) the window was shown for
+        self.last_key = None
+        self.last_change = time.monotonic()
+        self.acted = {}              # (host, path, state) -> [count, last time]
+        self.pw_submitted = False
+        self.user_submitted = False
+        self.pw_sent_at = 0.0
+        self.code_sent_at = None
+        self.code_prompts = 0
+        self.prompt_proc = None
+        self.duo = duo               # "push" (approve on the phone) or "passcode"
+        self.push_sends = 0          # pushes we asked Duo to (re)send
+        self.push_notice = 0         # id of the "approve the push" notification
+        self.push_notice_code = None
+        self.push_seen_at = None
+        self.no_push = False         # Duo offered no push; use the passcode instead
+        self.trace_lines = []
+
+        Gtk.init()
+        self.loop = GLib.MainLoop()
+        for d in (DATA_DIR / "webkit", CACHE_DIR / "webkit"):
+            d.mkdir(parents=True, exist_ok=True)
+        os.chmod(DATA_DIR, 0o700)
+        # A persistent session, so Microsoft's "stay signed in" and Duo's
+        # "remember this device" survive between connections.
+        self.session = WebKit.NetworkSession.new(str(DATA_DIR / "webkit"), str(CACHE_DIR / "webkit"))
+        self.session.get_cookie_manager().set_persistent_storage(
+            str(DATA_DIR / "webkit" / "cookies.sqlite"), WebKit.CookiePersistentStorage.SQLITE)
+        self.view = WebKit.WebView(network_session=self.session)
+        self.view.connect("load-changed", self.on_load_changed)
+        self.view.connect("load-failed", self.on_load_failed)
+        self.win = Gtk.Window(title=f"{TITLE} sign-in", default_width=520, default_height=720)
+        self.win.set_child(self.view)
+        self.win.connect("close-request", self.on_close)
+
+    # -- plumbing --------------------------------------------------------
+
+    def run(self, method, saml):
+        self.size_hidden_view()
+        if method == "POST":
+            self.view.load_html(saml, f"https://{self.vpn.host}/")
+        else:
+            self.view.load_uri(saml)
+        self.GLib.timeout_add(300, self.tick)
+        remaining = max(1, int(self.deadline - time.monotonic()))
+        self.GLib.timeout_add_seconds(remaining, self.on_timeout)
+        for sig in (signal.SIGTERM, signal.SIGINT):     # NetworkManager cancelled, or ^C
+            self.GLibUnix.signal_add(self.GLib.PRIORITY_HIGH, sig, self.on_signal)
+        self.loop.run()
+        self.win.destroy()
+        self.write_trace()
+        if self.error:
+            raise self.error
+        return self.result
+
+    def stop(self, result=None, error=None):
+        if self.result is None and self.error is None:
+            self.result, self.error = result, error
+        if self.prompt_proc is not None:               # don't leave a dialog behind
+            self.prompt_proc.force_exit()
+        close_notification(max(self.push_notice, 0))
+        self.push_notice = 0
+        self.loop.quit()
+
+    def trace(self, line):
+        self.trace_lines.append(f"{time.strftime('%H:%M:%S')} {line}")
+        log(line)
+
+    def write_trace(self):
+        try:
+            CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            TRACE_FILE.write_text("\n".join(self.trace_lines) + "\n")
+        except OSError:
+            pass
+
+    def js(self, script, callback=None):
+        def done(view, res):
+            try:
+                value = view.evaluate_javascript_finish(res)
+                out = value.to_string() if value is not None else None
+            except Exception as e:  # page navigated away mid-call, etc.
+                out, err = None, e
+            else:
+                err = None
+            self.busy = False
+            if callback:
+                callback(out, err)
+        self.busy = True
+        source = f"{JS_LIB}\n((NU) => ({script}))(__nuvpn)"
+        self.view.evaluate_javascript(source, -1, None, None, None, done)
+
+    def act(self, name, arg=None):
+        self.trace(f"  -> {name}")
+        script = JS_ACTIONS[name].replace("ARG", json.dumps(arg if arg is not None else ""))
+        self.js(script, lambda out, err: out != "ok" and self.trace(f"action {name} -> {out or err}"))
+
+    def prompt(self, kind, text, callback):
+        """Ask via kdialog without blocking the page; callback(value or None)."""
+        Gio = self.Gio
+        self.busy = True
+        proc = Gio.Subprocess.new(kdialog_argv(kind, text), Gio.SubprocessFlags.STDOUT_PIPE)
+        self.prompt_proc = proc
+
+        def done(p, res):
+            try:
+                _, out, _ = p.communicate_utf8_finish(res)
+            except Exception:
+                out = None
+            self.prompt_proc = None
+            if self.result is not None or self.error is not None:
+                return
+            self.busy = False
+            callback(out.rstrip("\n") if p.get_successful() and out is not None else None)
+        proc.communicate_utf8_async(None, None, done)
+
+    def show(self, why, st=None):
+        if self.shown:
+            return
+        if not self.interactive:
+            self.stop(error=Abort(f"sign-in needs you ({why})", EXIT_NEEDS_USER))
+            return
+        self.trace(f"showing the browser window: {why}")
+        self.shown = True
+        self.shown_at = (st or {}).get("host"), (st or {}).get("path"), (st or {}).get("state")
+        self.win.set_title(f"{TITLE}: please finish signing in")
+        self.win.present()
+
+    # -- signals ---------------------------------------------------------
+
+    def on_close(self, *_):
+        self.stop(error=Abort("sign-in window closed", EXIT_CANCELED))
+        return True
+
+    def on_signal(self):
+        self.stop(error=Abort("cancelled", EXIT_CANCELED))
+        return False
+
+    def on_timeout(self):
+        self.stop(error=Abort("sign-in timed out"))
+        return False
+
+    def on_load_failed(self, view, event, uri, err):
+        # Cancelled loads (redirect chains) are normal.
+        if not err.matches(self.WebKit.network_error_quark(), self.WebKit.NetworkError.CANCELLED):
+            self.trace(f"load failed: {urllib.parse.urlsplit(uri or '').hostname}: {err.message}")
+        return False
+
+    def on_load_changed(self, view, event):
+        if event != self.WebKit.LoadEvent.FINISHED:
+            return
+        uri = view.get_uri() or ""
+        host = urllib.parse.urlsplit(uri).hostname
+        resource = view.get_main_resource()
+        response = resource.get_response() if resource else None
+        headers = response.get_http_headers() if response else None
+        found = {}
+        if headers is not None:
+            for k in ("saml-auth-status", "saml-username", "prelogin-cookie", "portal-userauthcookie"):
+                v = headers.get_one(k)
+                if v:
+                    found[k] = v
+        if self.check_done(found):
+            return
+        if host == self.vpn.host and resource is not None:
+            # Some PAN-OS versions put the values in an HTML comment instead.
+            resource.get_data(None, self.on_portal_body)
+
+    def on_portal_body(self, resource, res):
+        try:
+            data = resource.get_data_finish(res)
+        except Exception:
+            return
+        body = bytes(data).decode("utf-8", "replace")
+        found = dict(re.findall(
+            r"<(saml-auth-status|saml-username|prelogin-cookie|portal-userauthcookie)>([^<]*)</\1>", body))
+        if not self.check_done({k: v for k, v in found.items() if v}):
+            if found.get("saml-auth-status") == "-1":
+                self.stop(error=Abort("the VPN portal rejected the sign-in"))
+
+    def check_done(self, found):
+        if found.get("saml-username") and (found.get("prelogin-cookie") or found.get("portal-userauthcookie")):
+            self.trace(f"portal accepted SAML sign-in for {found['saml-username']}")
+            self.stop(result=found)
+            return True
+        return False
+
+    # -- the state machine -----------------------------------------------
+
+    def size_hidden_view(self):
+        # A never-shown view gets a 0x0 viewport, which squashes page layout.
+        if not self.shown:
+            self.view.allocate(520, 720, -1, None)
+
+    def tick(self):
+        if self.result is not None or self.error is not None:
+            return False
+        self.size_hidden_view()
+        if not self.busy:
+            self.js(JS_CLASSIFY, self.on_classified)
+        return True
+
+    def on_classified(self, out, err):
+        if out is None:
+            return
+        try:
+            st = json.loads(out)
+        except ValueError:
+            return
+        now = time.monotonic()
+        state = st.get("state")
+        key = (st.get("host"), st.get("path"), state, st.get("error"))
+        if key != self.last_key:
+            self.last_key, self.last_change = key, now
+            desc = f"page {st.get('host')}{st.get('path')} state={state or '?'}"
+            if st.get("error"):
+                desc += f" error={st['error']!r}"
+            desc += f" heading={st.get('heading')!r}"
+            if not state:
+                desc += f" buttons={st.get('buttons')}"
+            self.trace(desc)
+
+        if self.probe and state:
+            self.stop(result={"probe": st})
+            return
+        if not state:
+            if now - self.last_change > STUCK_AFTER:
+                self.show(f"unrecognised page on {st.get('host')}", st)
+            return
+        if state == "ms-error":
+            self.stop(error=Abort(f"Microsoft sign-in error: {st.get('error')}"))
+            return
+        if self.shown:
+            if (st.get("host"), st.get("path"), state) == self.shown_at:
+                return            # still on the page you're finishing by hand
+            self.trace("back on familiar pages; hiding the window again")
+            self.shown = False
+            self.win.set_visible(False)
+            self.size_hidden_view()
+        if state in SETTLE_STATES and st.get("age", SETTLE_MS) < SETTLE_MS:
+            return
+
+        handler = getattr(self, "on_" + state.replace("-", "_"))
+        handler(st, now)
+
+    def tried(self, st, now, wait=4.0):
+        """Rate-limit an action per page/state; False if we should wait."""
+        k = (st.get("host"), st.get("path"), st.get("state"))
+        count, last = self.acted.get(k, (0, 0.0))
+        if now - last < wait:
+            return False
+        if count >= MAX_TRIES:
+            self.show(f"stuck at {st.get('state')} on {st.get('host')}", st)
+            return False
+        self.acted[k] = (count + 1, now)
+        return True
+
+    def on_username(self, st, now):
+        if self.user_submitted and st.get("errorField") == "username":
+            self.stop(error=Abort(f"Microsoft doesn't accept the username {self.username!r}: "
+                                  f"{st.get('error')}  (fix it with: {APP} setup)"))
+            return
+        if self.tried(st, now):
+            self.user_submitted = True
+            self.act("username", self.username)
+
+    def on_picker(self, st, now):
+        if self.tried(st, now):
+            self.act("picker", self.username)
+
+    def on_password(self, st, now):
+        # Wait for Microsoft to answer before believing an error on the page.
+        if now - self.pw_sent_at < 5:
+            return
+        if self.pw_submitted and st.get("errorField") == "password":
+            if not self.interactive:
+                self.stop(error=Abort("Microsoft rejected the saved password", EXIT_NEEDS_USER))
+                return
+            self.pw_submitted = False
+            self.acted.pop((st.get("host"), st.get("path"), "password"), None)
+
+            def got(pw):
+                if pw is None:
+                    self.stop(error=Abort("cancelled", EXIT_CANCELED))
+                    return
+                store_password(self.username, pw)
+                self.trace("saved the new password in the keyring")
+                self.pw_submitted = True
+                self.pw_sent_at = time.monotonic()
+                self.act("password", {"user": self.username, "pw": pw})
+            self.prompt("password", f"Microsoft didn't accept the saved password for {self.username}.\n"
+                                    f"Current password:", got)
+            return
+        if not self.tried(st, now, wait=6.0):
+            return
+        pw = get_password(self.username)
+        if not pw:
+            self.stop(error=Abort(f"no password saved for {self.username}; run: {APP} setup"))
+            return
+        self.pw_submitted = True
+        self.pw_sent_at = time.monotonic()
+        self.act("password", {"user": self.username, "pw": pw})
+
+    def on_kmsi(self, st, now):
+        if self.tried(st, now):
+            self.act("kmsi")
+
+    def on_proofs(self, st, now):
+        if self.tried(st, now):
+            self.act("proofs")
+
+    def on_continue(self, st, now):
+        if self.tried(st, now):
+            self.act("continue")
+
+    def push_mode(self):
+        return self.duo == "push" and not self.no_push
+
+    def on_other_options(self, st, now):
+        if self.push_mode():
+            self.wait_for_push(st, now)
+        elif self.tried(st, now, wait=3.0):
+            self.act("other-options")
+
+    def wait_for_push(self, st, now):
+        """On Duo's push screen: tell you, then wait for your phone."""
+        if self.push_denied(st):
+            return
+        if not self.interactive:
+            self.stop(error=Abort("Duo wants a push approved", EXIT_NEEDS_USER))
+            return
+        code = st.get("pushCode")
+        if not code and not self.push_notice:
+            # Duo draws the number a moment after the screen; don't announce a
+            # plain push and then change our mind.
+            self.push_seen_at = self.push_seen_at or now
+            if now - self.push_seen_at < 2.0:
+                return
+        if not self.push_notice or code != self.push_notice_code:
+            if code:
+                summary, text = f"Duo code: {code}", f"Enter {code} in Duo Mobile to approve the VPN sign-in."
+            else:
+                summary, text = TITLE, "Approve the Duo push on your phone."
+            self.trace("waiting for you to approve the Duo push" + (f" (code {code})" if code else ""))
+            self.push_notice = notify(text, max(self.push_notice, 0), timeout_ms=0,
+                                      summary=summary, urgent=True) or -1
+            self.push_notice_code = code
+
+    def push_denied(self, st):
+        """You tapped Deny on the phone: that's a cancel, not a reason to push again."""
+        said = f"{st.get('error') or ''} {st.get('heading') or ''}"
+        if re.search(r"denied|declined|fraud", said, re.I):
+            self.stop(error=Abort(f"Duo push denied ({said.strip()})", EXIT_CANCELED))
+            return True
+        return False
+
+    def on_push_send(self, st, now):
+        if not self.push_mode():
+            if self.tried(st, now, wait=3.0):
+                self.act("other-options")
+            return
+        if self.push_denied(st):
+            return
+        if self.push_sends >= MAX_PUSHES:
+            self.stop(error=Abort("the Duo push wasn't approved", EXIT_CANCELED))
+            return
+        if self.tried(st, now, wait=3.0):
+            self.push_sends += 1
+            self.act("push-send")
+
+    def on_methods(self, st, now):
+        if self.duo == "push" and not any(m.lower().startswith("duo push") for m in st.get("methods", [])):
+            self.trace("Duo offers no push here; using the Duo Mobile passcode")
+            self.no_push = True
+        if self.tried(st, now, wait=3.0):
+            self.act("method-push" if self.push_mode() else "methods")
+
+    def on_trust(self, st, now):
+        if self.tried(st, now):
+            self.act("trust")
+
+    def on_passcode(self, st, now):
+        if self.push_mode() and not self.shown:
+            # Duo opened on the passcode screen (the last method used); go to the push.
+            if self.tried(st, now, wait=3.0):
+                self.act("other-options")
+            return
+        if self.code_sent_at is not None:
+            since = now - self.code_sent_at
+            # Give Duo time to check the code before asking again.
+            if since < 3 or (not st.get("error") and since < 15):
+                return
+        if not self.interactive:
+            self.stop(error=Abort("Duo wants a passcode", EXIT_NEEDS_USER))
+            return
+        if self.code_prompts >= MAX_TRIES:
+            self.show("Duo didn't accept the passcode", st)
+            return
+        self.code_prompts += 1
+        self.trace("asking you for the Duo Mobile passcode")
+        text = "Duo Mobile passcode:"
+        if self.code_sent_at is not None and st.get("error"):
+            text = f"Duo said: {st['error']}\n\n{text}"
+
+        def got(code):
+            if code is None:
+                self.stop(error=Abort("cancelled", EXIT_CANCELED))
+                return
+            self.code_sent_at = time.monotonic()
+            self.act("passcode", re.sub(r"\s+", "", code))
+        self.prompt("code", text, got)
+
+
+# ------------------------------------------------------------- commands ----
+
+def do_login(cfg, uuid, interactive=True, timeout=LOGIN_TIMEOUT, probe=False):
+    deadline = time.monotonic() + timeout
+    username = cfg.get("login", "username", fallback="").strip()
+    if not username and not probe:
+        raise Abort(f"no username configured; run: {APP} setup")
+    vpn = VpnInfo(nm_vpn_data(uuid), cfg.get("vpn", "gateway", fallback="").strip())
+    method, saml = prelogin(vpn)
+    log(f"portal {vpn.host} wants SAML ({method}); signing in as {username}")
+    duo = cfg.get("login", "duo", fallback="push").strip().lower()
+    if duo not in ("push", "passcode"):
+        raise Abort(f"[login] duo must be push or passcode, not {duo!r}")
+    browser = SamlBrowser(vpn, username, interactive, deadline, probe=probe, duo=duo)
+    result = browser.run(method, saml)
+    if probe:
+        return result
+    return openconnect_auth(vpn, result)
+
+
+def cmd_login(args, cfg):
+    uuid = args.uuid or (config_uuids(cfg) or [None])[0]
+    if not uuid:
+        raise Abort(f"no VPN connection configured; run: {APP} setup")
+    if os.environ.get("NU_VPN_FAKE_LOGIN"):          # for testing the agent wiring only
+        secrets = {"cookie": "fake", "gateway": "https://127.0.0.1:9/", "gwcert": "pin-sha256:fake"}
+    else:
+        secrets = do_login(cfg, uuid, interactive=not args.no_interaction,
+                           timeout=args.timeout, probe=args.probe)
+    if args.json:
+        json.dump(secrets, sys.stdout)
+        sys.stdout.write("\n")
+    elif args.probe:
+        print(json.dumps(secrets["probe"], indent=2))
+    else:
+        print(f"signed in; gateway {secrets['gateway']} (cookie not shown)")
+
+
+def cmd_setup(args, cfg):
+    if args.uuid:
+        cfg.set("vpn", "uuid", args.uuid)
+    if args.gateway is not None:
+        cfg.set("vpn", "gateway", args.gateway)
+    username = args.username or ask_sync(
+        "text", "Northeastern username (as you type it on the Microsoft sign-in page):",
+        cfg.get("login", "username", fallback=""))
+    username = username.strip()
+    if not username:
+        raise Abort("no username given")
+    cfg.set("login", "username", username)
+    save_config(cfg)
+    if not args.keep_password or not get_password(username):
+        pw = ask_sync("password", f"Password for {username}:")
+        if not pw:
+            raise Abort("no password given")
+        store_password(username, pw)
+    print(f"saved: username in {CONFIG_FILE}, password in the keyring")
+
+
+def cmd_forget(args, cfg):
+    shutil.rmtree(DATA_DIR / "webkit", ignore_errors=True)
+    shutil.rmtree(CACHE_DIR / "webkit", ignore_errors=True)
+    print("cleared the remembered Microsoft/Duo browser session")
+
+
+def cmd_connect(args, cfg):
+    import dbus
+    uuid = args.uuid or (config_uuids(cfg) or [None])[0]
+    if not uuid:
+        raise Abort(f"no VPN connection configured; run: {APP} setup")
+    NM = "org.freedesktop.NetworkManager"
+    bus = dbus.SystemBus()
+    settings = dbus.Interface(bus.get_object(NM, "/org/freedesktop/NetworkManager/Settings"),
+                              NM + ".Settings")
+    path = settings.GetConnectionByUuid(uuid)
+    # Not `nmcli connection up`: nmcli answers its own secrets request with
+    # "cancelled". Activating from a process with no secret agent makes
+    # NetworkManager ask the agents in their usual order, like Plasma's applet.
+    nm = dbus.Interface(bus.get_object(NM, "/org/freedesktop/NetworkManager"), NM)
+    active = nm.ActivateConnection(path, dbus.ObjectPath("/"), dbus.ObjectPath("/"))
+    props = dbus.Interface(bus.get_object(NM, active), "org.freedesktop.DBus.Properties")
+    print("connecting...", flush=True)
+    deadline = time.monotonic() + LOGIN_TIMEOUT + 60
+    while time.monotonic() < deadline:
+        try:
+            state = int(props.Get(NM + ".Connection.Active", "State"))
+        except dbus.DBusException:
+            state = 4                                    # object gone: it failed
+        if state == 2:
+            print("connected")
+            return
+        if state >= 3:
+            raise Abort("the VPN connection failed (see: journalctl --user -u nu-vpn-agent)")
+        time.sleep(0.5)
+    raise Abort("gave up waiting for the VPN to connect")
+
+
+# ---------------------------------------------------------------- agent ----
+
+def cmd_agent(args, cfg):
+    import dbus
+    import dbus.service
+    import dbus.mainloop.glib
+    from gi.repository import Gio, GLib
+
+    NM = "org.freedesktop.NetworkManager"
+    AGENT_IFACE = NM + ".SecretAgent"
+    ERR = NM + ".SecretAgent."
+    uuids = set(config_uuids(cfg))
+    if not uuids:
+        raise Abort(f"no VPN connection configured; run: {APP} setup")
+
+    dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+    bus = dbus.SystemBus()
+    loop = GLib.MainLoop()
+
+    class AgentError(dbus.DBusException):
+        def __init__(self, name, msg):
+            super().__init__(msg, name=ERR + name)
+
+    class Agent(dbus.service.Object):
+        def __init__(self):
+            super().__init__(bus, "/org/freedesktop/NetworkManager/SecretAgent")
+            self.pending = {}   # (connection path, setting name) -> (process, error callback)
+            self.failed_at = {}  # uuid -> when our last sign-in failed
+            self.canceled_at = {}  # uuid -> when you last cancelled
+
+        @dbus.service.method(AGENT_IFACE, in_signature="a{sa{sv}}osasu", out_signature="a{sa{sv}}",
+                             async_callbacks=("reply", "error"))
+        def GetSecrets(self, connection, path, setting_name, hints, flags, reply, error):
+            con = connection.get("connection", {})
+            uuid = str(con.get("uuid", ""))
+            if setting_name != "vpn" or uuid not in uuids:
+                error(AgentError("NoSecrets", "not a connection nu-vpn handles"))
+                return
+            key = (str(path), str(setting_name))
+            if key in self.pending:
+                error(AgentError("NoSecrets", "a sign-in is already running"))
+                return
+            # NetworkManager first asks with only USER_REQUESTED (0x4), then again
+            # with ALLOW_INTERACTION (0x1). Plasma only shows its window in the
+            # second round, so when you clicked Connect we can ask for the Duo
+            # code straight away. Without either flag (autoconnect), stay silent.
+            interactive = bool(flags & 0x5)
+            # Cancelling in the first round doesn't stop NetworkManager; it asks
+            # again straight away. Make the cancel stick.
+            if time.monotonic() - self.canceled_at.pop(uuid, -1e9) < 15:
+                log("you just cancelled; cancelling this round too")
+                error(AgentError("UserCanceled", "cancelled"))
+                return
+            if time.monotonic() - self.failed_at.get(uuid, -1e9) < 60:
+                log("our sign-in just failed; leaving this round to Plasma's dialog")
+                self.failed_at.pop(uuid)
+                error(AgentError("NoSecrets", "nu-vpn sign-in failed"))
+                return
+            log(f"secrets requested for {con.get('id', uuid)} (flags {int(flags):#x})")
+            argv = [sys.executable, str(SCRIPT), "login", "--json", "--uuid", uuid,
+                    "--timeout", str(LOGIN_TIMEOUT)]
+            if not interactive:
+                argv.append("--no-interaction")
+            proc = Gio.Subprocess.new(argv, Gio.SubprocessFlags.STDOUT_PIPE)
+            self.pending[key] = (proc, error)
+
+            def done(p, res):
+                try:
+                    _, out, _ = p.communicate_utf8_finish(res)
+                except Exception:
+                    out = ""
+                if self.pending.pop(key, None) is None:
+                    return        # already cancelled and answered
+                status = p.get_exit_status() if p.get_if_exited() else -1
+                if status == 0:
+                    try:
+                        secrets = json.loads(out)
+                    except ValueError:
+                        error(AgentError("NoSecrets", "sign-in helper returned garbage"))
+                        return
+                    log("sign-in done; handing the cookie to NetworkManager")
+                    reply({"vpn": {"secrets": dbus.Dictionary(secrets, signature="ss")}})
+                elif status == EXIT_CANCELED:
+                    log("sign-in cancelled")
+                    self.canceled_at[uuid] = time.monotonic()
+                    error(AgentError("UserCanceled", "cancelled"))
+                elif status == EXIT_NEEDS_USER:
+                    log("sign-in needs you; waiting for NetworkManager's interactive round")
+                    error(AgentError("NoSecrets", "nu-vpn needs interaction"))
+                else:
+                    log(f"sign-in failed (exit {status}); Plasma's dialog gets the next try")
+                    self.failed_at[uuid] = time.monotonic()
+                    error(AgentError("NoSecrets", "nu-vpn sign-in failed"))
+            proc.communicate_utf8_async(None, None, done)
+
+        @dbus.service.method(AGENT_IFACE, in_signature="os", out_signature="")
+        def CancelGetSecrets(self, path, setting_name):
+            entry = self.pending.pop((str(path), str(setting_name)), None)
+            if entry:
+                proc, error = entry
+                log("NetworkManager cancelled the request")
+                proc.send_signal(15)
+                error(AgentError("AgentCanceled", "cancelled by NetworkManager"))
+
+        @dbus.service.method(AGENT_IFACE, in_signature="a{sa{sv}}o", out_signature="")
+        def SaveSecrets(self, connection, path):
+            pass          # nothing to keep: the cookie is single-use
+
+        @dbus.service.method(AGENT_IFACE, in_signature="a{sa{sv}}o", out_signature="")
+        def DeleteSecrets(self, connection, path):
+            pass
+
+    agent = Agent()
+
+    def register(owner):
+        if not owner:
+            log("NetworkManager went away; waiting")
+            return
+        try:
+            mgr = dbus.Interface(bus.get_object(NM, "/org/freedesktop/NetworkManager/AgentManager"),
+                                 NM + ".AgentManager")
+            mgr.RegisterWithCapabilities("edu.northeastern.nu-vpn", dbus.UInt32(0x1))   # VPN_HINTS
+            log(f"registered with NetworkManager for {', '.join(sorted(uuids))}")
+        except dbus.DBusException as e:
+            log(f"could not register with NetworkManager: {e}")
+    bus.watch_name_owner(NM, register)
+
+    # NetworkManager asks the most recently *started* agent first. If Plasma's
+    # kded restarts after us, exit so systemd restarts us and we're newest again.
+    def start_time(pid):
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text()
+            return int(stat.rsplit(")", 1)[1].split()[19])
+        except (OSError, ValueError, IndexError):
+            return 0
+    mine = start_time(os.getpid())
+
+    def check_rivals():
+        if agent.pending:
+            return True
+        for p in Path("/proc").iterdir():
+            if not p.name.isdigit():
+                continue
+            try:
+                if p.stat().st_uid != os.getuid() or (p / "comm").read_text().strip() not in ("kded6", "kded5"):
+                    continue
+            except OSError:
+                continue
+            if start_time(p.name) > mine:
+                log("Plasma's agent restarted after us; restarting to stay first in line")
+                loop.quit()
+                return False
+        return True
+    GLib.timeout_add_seconds(30, check_rivals)
+
+    loop.run()
+
+
+# ----------------------------------------------------------------- main ----
+
+def main():
+    ap = argparse.ArgumentParser(prog=APP, description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("setup", help="save username and password")
+    p.add_argument("--username")
+    p.add_argument("--uuid", help="NetworkManager connection UUID to handle")
+    p.add_argument("--gateway", help="GlobalProtect gateway to choose from the portal list")
+    p.add_argument("--keep-password", action="store_true", help="don't ask again if one is saved")
+    p.set_defaults(func=cmd_setup)
+
+    p = sub.add_parser("login", help="run the sign-in once (debugging)")
+    p.add_argument("--uuid")
+    p.add_argument("--json", action="store_true", help="print the secrets as JSON (used by the agent)")
+    p.add_argument("--no-interaction", action="store_true")
+    p.add_argument("--timeout", type=int, default=LOGIN_TIMEOUT)
+    p.add_argument("--probe", action="store_true",
+                   help="stop at the first recognised sign-in page and describe it; submits nothing")
+    p.set_defaults(func=cmd_login)
+
+    p = sub.add_parser("agent", help="run the NetworkManager secret agent")
+    p.set_defaults(func=cmd_agent)
+
+    p = sub.add_parser("connect", help="bring the VPN up")
+    p.add_argument("--uuid")
+    p.set_defaults(func=cmd_connect)
+
+    p = sub.add_parser("forget", help="clear the remembered Microsoft/Duo session")
+    p.set_defaults(func=cmd_forget)
+
+    args = ap.parse_args()
+    try:
+        args.func(args, load_config())
+    except Abort as e:
+        log(str(e))
+        if args.cmd == "login" and e.code not in (EXIT_CANCELED, EXIT_NEEDS_USER):
+            notify(f"VPN sign-in failed: {e}")
+        sys.exit(e.code)
+    except KeyboardInterrupt:
+        sys.exit(EXIT_CANCELED)
+
+
+if __name__ == "__main__":
+    main()
